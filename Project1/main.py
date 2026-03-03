@@ -136,21 +136,26 @@ class Fetch_wrds:
     
     def fetch_bid_ask(self): 
         """
-         Fetches daily bid and ask prices from CRSP via WRDS database
+        Fetches daily bid and ask prices from CRSP via WRDS database.
+        
+        Note: crsp.dsf does not have a ticker column — it uses permno as primary key.
+        We join crsp.dsf with crsp.dsenames to map tickers to permnos.
         """
-        #first need to convert tickers list into SQL readable format --> string
         tickers_str = "'" + "','".join(self.tickers) + "'"
 
         query = f"""
-            SELECT date, ticker, bid, ask
-            FROM crsp.dsf
-            WHERE ticker IN ({tickers_str})
-            AND date >= '{self.start_date}'
-            AND date <= '{self.end_date}'
-                """
-    
+            SELECT dsf.date, names.ticker, dsf.bid, dsf.ask
+            FROM crsp.dsf AS dsf
+            JOIN crsp.dsenames AS names
+                ON dsf.permno = names.permno
+            WHERE names.ticker IN ({tickers_str})
+            AND dsf.date >= '{self.start_date}'
+            AND dsf.date <= '{self.end_date}'
+            AND dsf.date BETWEEN names.namedt AND COALESCE(names.nameendt, CURRENT_DATE)
+            ORDER BY dsf.date, names.ticker
+        """
+
         data = self.db_connection.raw_sql(query, date_cols=['date'])
-        #data = data.pivot(index= 'date', )
 
         return data
          
