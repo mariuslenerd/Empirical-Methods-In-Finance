@@ -10,8 +10,10 @@ def plot_n_series(data,title,yscale,xlabel,ylabel) :
     plt.title(title)
     plt.xlabel(xlabel)
     plt.ylabel(ylabel)
-    #plt.yscale(yscale)
-    plt.plot(data)
+    for col in data.columns : 
+        plt.plot(data.index, data[col], label = col)
+    plt.legend(title = 'Ticker', loc = 'best')
+    plt.grid()
 
     return None
 
