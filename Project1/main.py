@@ -7,6 +7,7 @@ from statsmodels.tsa.stattools import coint
 import statsmodels.api as sm
 import wrds
 from statsmodels.tsa.stattools import adfuller
+from utils import plot_wealth_positions_spread
 
 
 class Fetch_Data :
@@ -348,12 +349,17 @@ class Simple_Pair_Trading :
     
 
 class Rolling_Pair_Trading : 
-    def __init__(self, window, coint_window,price_df,return_df, most_coint_pair_df):
+    def __init__(self, window, coint_window,data_raw, most_coint_pair_df, bid_ask_spread):
           self.window = window
           self.coint_window = coint_window
-          self.price_df = price_df
-          self.return_df = return_df
+          self.data_raw = data_raw
           self.most_coint_pair_df = most_coint_pair_df
+          self.bid_ask_spread = bid_ask_spread
+          self.price_df = self.data_raw[self.most_coint_pair_df.columns].reindex(self.bid_ask_spread.index)
+          self.return_df = self.price_df.pct_change()
+
+
+
     
     def extract_rolling_params(self) : 
         """
@@ -370,8 +376,8 @@ class Rolling_Pair_Trading :
         - Returns : None
         """
 
-        tickers_pair = list(self.most_coint_pair_df.columns) #fetch tickers from the most cointegrated pair
-        ticker_A, ticker_B = tickers_pair[0], tickers_pair[1] 
+        self.tickers_pair = list(self.most_coint_pair_df.columns) #fetch tickers from the most cointegrated pair
+        self.ticker_A, self.ticker_B = self.tickers_pair[0], self.tickers_pair[1] 
         n = len(self.most_coint_pair_df) #nb of rows 
 
         # Now we create empty series for storing rolling spread and betas
@@ -384,14 +390,14 @@ class Rolling_Pair_Trading :
             estimation_data = self.most_coint_pair_df.iloc[t - self.window : t]
 
             selectpair_roll = Select_Pair(estimation_data)
-            alpha, beta, resid = selectpair_roll.extract_ratios_cointegrated_pair(estimation_data, tickers_pair)
+            self.alpha, beta, resid = selectpair_roll.extract_ratios_cointegrated_pair(estimation_data, self.tickers_pair)
 
             # Now we can estimate the spread : 
             # BKNGG_t = alpha + beta IHG_t + eps_t where alpha and beta 
             # Are based on the last 252 days until yesterday but we use todays price 
             # Based on the predicted equilibrium price (which is based on last 252 days), we
             # trade if the actual price deviates from its equilibrium
-            spread_t = self.most_coint_pair_df[ticker_A].iloc[t] - alpha - beta * self.most_coint_pair_df[ticker_B].iloc[t]
+            spread_t = self.most_coint_pair_df[self.ticker_A].iloc[t] - self.alpha - beta * self.most_coint_pair_df[self.ticker_B].iloc[t]
 
             # Now we normalize today's spread using the last 252 days mean resid and std
             rolling_spread.iloc[t] = (spread_t - resid.mean()) / resid.std()
@@ -402,6 +408,72 @@ class Rolling_Pair_Trading :
         self.rolling_beta_clean   = rolling_beta.dropna()
 
         return None
+
+    def simple_rolling_pair_trading(self,threshold) : 
+        """
+         Fct responsible for the pair trading strategy where parameters are estimated based on a 1y window
+         Prevents look ahead bias (when using future data for today's decision)
+
+            - Args : self
+            - Returns : None
+        """
+         # Rolling trading loop
+         # Same logic as simple_pair_trading but with time-varying beta for position sizing and time-varying spread 
+         # for entry/exit signals
+        long_A = False
+        short_A = False
+
+        pos_A = np.zeros(len(self.rolling_spread_clean))
+        pos_B = np.zeros(len(self.rolling_spread_clean))
+
+        for i, (t, val) in enumerate(self.rolling_spread_clean.items()):
+            b = self.rolling_beta_clean[t]   # beta estimated on past window : used for position size
+
+            if i > 0:   # carry forward
+                pos_A[i] = pos_A[i-1]
+                pos_B[i] = pos_B[i-1]
+
+            if not short_A and not long_A:
+                if val >= threshold:            # spread too high : short A, long B
+                    pos_A[i] = -1
+                    pos_B[i] =  b
+                    short_A = True
+                elif val <= -threshold:         # spread too low : long A, short B
+                    pos_A[i] =  1
+                    pos_B[i] = -b
+                    long_A = True
+            elif short_A and val <= 0:           # spread reverted : close
+                pos_A[i] = 0
+                pos_B[i] = 0
+                short_A = False
+            elif long_A and val >= 0:           # spread reverted : close
+                pos_A[i] = 0;  pos_B[i] = 0
+                long_A = False
+
+        # Build positions DataFrame with datetime index 
+        rolling_pos_A = pd.Series(pos_A, index=self.rolling_spread_clean.index, name=self.ticker_A)
+        rolling_pos_B = pd.Series(pos_B, index=self.rolling_spread_clean.index, name=self.ticker_B)
+        rolling_positions = pd.concat([rolling_pos_A, rolling_pos_B], axis=1)
+
+        # PnL using the same method as before
+        rolling_price_df   = self.price_df[self.tickers_pair].reindex(self.rolling_spread_clean.index) #re-index the original data to match
+        rolling_returns_df = rolling_price_df.pct_change()
+        rolling_spread_df  = self.bid_ask_spread.reindex(self.rolling_spread_clean.index)
+
+        rolling_simpletrade = Simple_Pair_Trading(
+            self.most_coint_pair_df[self.ticker_A], self.most_coint_pair_df[self.ticker_B],
+            self.rolling_spread_clean, self.alpha, self.rolling_beta_clean.mean(), threshold
+        )
+        rolling_cum_pnl, rolling_sharpe = rolling_simpletrade.pnl_calculations(
+            rolling_positions, rolling_price_df, rolling_returns_df, rolling_spread_df
+        )
+
+        # Plot using previously coded fct 
+        plot_wealth_positions_spread(
+            self.most_coint_pair_df.reindex(self.rolling_spread_clean.index),
+            self.rolling_spread_clean, threshold, rolling_positions, rolling_cum_pnl
+        )
+        print(f"Sharpe ratio (rolling, annualised): {rolling_sharpe:.4f}")
 
             
                 
