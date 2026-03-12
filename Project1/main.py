@@ -202,17 +202,27 @@ class Fetch_wrds:
         # Swap levels so ticker is first, then bid/ask
         data_bid_ask = data_bid_ask.swaplevel(axis=1).sort_index(axis=1)
 
-        return data_bid_ask
+        spread_BKNG = pd.Series(data_bid_ask['BKNG']['ask'] - data_bid_ask['BKNG']['bid']).rename('BKNG')
+        spread_IHG = pd.Series(data_bid_ask['IHG']['ask'] - data_bid_ask['IHG']['bid']).rename('IHG')
+
+        bid_ask_spread = pd.DataFrame([spread_BKNG,spread_IHG]).transpose()
+
+
+
+        return bid_ask_spread
          
 
 class Simple_Pair_Trading : 
-    def __init__(self, price_A, price_B, std_residuals, alpha, beta, threshold) : 
-        self.price_A = price_A
-        self.price_B = price_B
+    def __init__(self, data_raw,data_most_coint_pair,std_residuals,bid_ask_spread, alpha, beta, threshold) : 
+        self.data_raw = data_raw
         self.alpha = alpha
         self.beta = beta
         self.spread = std_residuals
+        self.bid_ask_spread = bid_ask_spread
         self.threshold = threshold
+        self.data_most_coint_pair = data_most_coint_pair
+        self.price_df = self.data_raw[self.data_most_coint_pair.columns].reindex(self.spread.index)
+        self.return_df = self.price_df.pct_change()
     
     def simple_pair_trading(self) : 
         """
@@ -251,8 +261,6 @@ class Simple_Pair_Trading :
         """
         long_A = False
         short_A = False
-        long_B = False
-        short_B = False
 
         position_A = np.zeros(len(self.spread))
         position_B = np.zeros(len(self.spread))
@@ -268,29 +276,36 @@ class Simple_Pair_Trading :
                     position_B[i] = self.beta
 
                     short_A = True
-                    long_B = True
+    
                 if val <= -self.threshold : #if spread below threshold : open position long_A, short_B
                     position_A[i] = 1
                     position_B[i] = -self.beta
 
                     long_A = True
-                    short_B = True
+
             elif short_A and val<0: #we are short A --> we have opened an upward position --> close it if spread goes below 0 
                 position_A[i] = 0
                 position_B[i] = 0
 
                 short_A = False
-                long_B = False
+
             elif long_A and val >= 0 : 
                 position_A[i] = 0
                 position_B[i] = 0
 
                 long_A = False
-                short_B = False
-        
-        return position_A,position_B
 
-    def pnl_calculations(self,positions_df,price_df, return_df,spread_df):
+        
+        # Attach datetime index from std_residuals (positions come out as plain integer-indexed arrays)
+        position_A = pd.Series(position_A, index=self.spread.index, name=self.data_most_coint_pair.columns[0])
+        position_B = pd.Series(position_B, index=self.spread.index, name=self.data_most_coint_pair.columns[1])
+        self.positions_df  = pd.concat([position_A, position_B], axis=1)
+
+      
+        
+        return self.positions_df
+
+    def pnl_calculations(self):
         """
         Function that calculates the PnL of a strategy based on the positions taken on asset A and on asset B 
         In order to make it as realistic as possible, I take into account the bid-ask spread (buy at bid, sell at ask)
@@ -305,16 +320,16 @@ class Simple_Pair_Trading :
         Returns : 
             - cum_pnl (pd.DataFrame) : df of the evolution of the cumulative PnL 
         """
-        lagged_positions = positions_df.shift(1).fillna(0)
-        position_changes = positions_df.diff().fillna(0)
-        raw_pnl = lagged_positions.values*return_df.values
+        lagged_positions = self.positions_df.shift(1).fillna(0)
+        position_changes = self.positions_df.diff().fillna(0)
+        raw_pnl = lagged_positions.values*self.return_df.values
 
         pnl = raw_pnl.sum(axis = 1)
 
 
 
 
-        transaction_cost_pct = (spread_df/2)/price_df
+        transaction_cost_pct = (self.bid_ask_spread_df/2)/self.price_df
         transactions_costs = (transaction_cost_pct*np.abs(position_changes.values)).sum(axis=1)
 
 
@@ -330,23 +345,82 @@ class Simple_Pair_Trading :
         
 
         return cum_pnl,sharpe_ratio
+    
+
+class Rolling_Pair_Trading : 
+    def __init__(self, window, coint_window,price_df,return_df, most_coint_pair_df):
+          self.window = window
+          self.coint_window = coint_window
+          self.price_df = price_df
+          self.return_df = return_df
+          self.most_coint_pair_df = most_coint_pair_df
+    
+    def extract_rolling_params(self) : 
+        """
+        Function responsible for extracting beta and estimating the spread based on a 252 days rolling window
+        This prevents look ahead bias that was performed during the previous simple pair trading class
+        The estimation window is 252 days.
+        
+        What happens is that during the first 252 days, we use this data to get a first
+        estimate of alpha,beta and the spread by regressing BKNG price on IHG price. 
+        We then normalize the spread by using the mean of the residuals as well as its std
+        (based on the last 252 days only). We add them to a empty lists and go forward, etc
+        until reaching the end of the overall period. 
+        - Args : self
+        - Returns : None
+        """
+
+        tickers_pair = list(self.most_coint_pair_df.columns) #fetch tickers from the most cointegrated pair
+        ticker_A, ticker_B = tickers_pair[0], tickers_pair[1] 
+        n = len(self.most_coint_pair_df) #nb of rows 
+
+        # Now we create empty series for storing rolling spread and betas
+        # We do not trade during the first window : it serves for estimating the params
+        rolling_spread = pd.Series(np.nan, index=self.most_coint_pair_df.index)
+        rolling_beta   = pd.Series(np.nan, index=self.most_coint_pair_df.index)
+
+        for t in range(self.window, n): #252 --> 3'774
+        # Estimation window : We fetch the data for the current period --> [0:252], [1:253],..., [3522:3774]
+            estimation_data = self.most_coint_pair_df.iloc[t - self.window : t]
+
+            selectpair_roll = Select_Pair(estimation_data)
+            alpha, beta, resid = selectpair_roll.extract_ratios_cointegrated_pair(estimation_data, tickers_pair)
+
+            # Now we can estimate the spread : 
+            # BKNGG_t = alpha + beta IHG_t + eps_t where alpha and beta 
+            # Are based on the last 252 days until yesterday but we use todays price 
+            # Based on the predicted equilibrium price (which is based on last 252 days), we
+            # trade if the actual price deviates from its equilibrium
+            spread_t = self.most_coint_pair_df[ticker_A].iloc[t] - alpha - beta * self.most_coint_pair_df[ticker_B].iloc[t]
+
+            # Now we normalize today's spread using the last 252 days mean resid and std
+            rolling_spread.iloc[t] = (spread_t - resid.mean()) / resid.std()
+            rolling_beta.iloc[t]   = beta
+
+        # Drop the NaN warm-up period
+        self.rolling_spread_clean = rolling_spread.dropna()
+        self.rolling_beta_clean   = rolling_beta.dropna()
+
+        return None
+
+            
+                
+
+                    
+                
             
 
-                 
+                    
+
+
+        
             
-          
-
-                  
 
 
-    
         
-
-
-     
+            
+            
         
-        
-    
 
 
 
